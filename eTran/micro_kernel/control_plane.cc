@@ -1110,11 +1110,15 @@ static void *control_loop(void *arg)
         tcp_e = get_cycles();
 
         /* poll homa timeout events */
+#ifndef HOOKSHIFT_TCP_ONLY
         if (get_cycles() >= homa_next_tsc)
         {
             poll_homa_to();
             homa_next_tsc = get_cycles() + us_to_cycles(TICK_US);
         }
+#else
+        (void)homa_next_tsc; /* Homa skipped (HOOKSHIFT_TCP_ONLY, trans_ebpf.h) */
+#endif
 
         /* decide how long to block */
         uint64_t t = cycles_to_us(tcp_e - tcp_s);

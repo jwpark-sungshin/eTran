@@ -3,6 +3,13 @@
 
 #include "ebpf.h"
 
+/* HookShift: TCP-only micro_kernel for the 3-way comparison (kernel-TCP/rbmc/eTran).
+ * Skips Homa eBPF load/init (cpumap-prog attach EPERMs on 6.6.142-etran) AND the
+ * control-loop Homa timeout poller (poll_homa_to reads the uninitialized
+ * _homa_rpc_fd -> garbage batch count -> delete_keys[] overflow segfault).
+ * Comment out to restore Homa. */
+#define HOOKSHIFT_TCP_ONLY 1
+
 struct homa_params_t
 {
     int workload_type;

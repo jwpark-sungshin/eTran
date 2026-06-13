@@ -171,7 +171,12 @@ static inline int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts)
 #ifdef DEBUG_TCP
                 fprintf(stdout, "Unrecognized option kind = %u\n", opt_kind);
 #endif
-                return -1;
+                /* HookShift: skip unknown TCP options (e.g. sackOK/wscale from a
+                 * standard kernel client) per RFC instead of rejecting the packet.
+                 * eTran does not echo them in its SYN-ACK, so the features are
+                 * simply not negotiated. Guard malformed length. */
+                if (opt_len < 2)
+                    return -1;
             }
             off += opt_len;
         }
@@ -325,6 +330,10 @@ static void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p)
     memcpy(&p->ip, &orig_p->ip, sizeof(p->ip));
     p->ip.src = orig_p->ip.dest;
     p->ip.dest = orig_p->ip.src;
+    /* HookShift: the memcpy above keeps the original packet's len/chksum;
+     * set the RST's own length and zero the checksum seed. */
+    p->ip.len = htons(len - offsetof(struct pkt_tcp, ip));
+    p->ip.chksum = 0;
 
     /* fill tcp header */
     p->tcp.src = orig_p->tcp.dest;
@@ -336,9 +345,14 @@ static void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p)
     p->tcp.chksum = 0;
     p->tcp.urgp = 0;
 
-    /* calculate header checksums */
-    p->ip.chksum = ip_fast_csum((const void *)&p->ip, p->ip._v_hl);
-    p->tcp.chksum = tcp_csum(p->ip.src, p->ip.dest, len, IPPROTO_TCP, (uint8_t *)tcp);
+    /* calculate header checksums.
+     * HookShift: ip_fast_csum() takes the header length in 32-bit words (ihl),
+     * not the raw version+ihl byte (0x45 would checksum 276 bytes); tcp_csum()
+     * takes the TCP segment length, not the full frame length. Standard kernel
+     * peers validate these (eTran<->eTran never did, so both were latent). */
+    p->ip.chksum = ip_fast_csum((const void *)&p->ip, p->ip._v_hl & 0x0f);
+    p->tcp.chksum = tcp_csum(p->ip.src, p->ip.dest, len - offsetof(struct pkt_tcp, tcp),
+                             IPPROTO_TCP, (uint8_t *)tcp);
 
     /* send packet */
     slow_path_send_tcp(actx, p, len, false, POISON_32);
@@ -423,9 +437,14 @@ static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt
         opt_ts->ts_ecr = htonl(ts_echo);
     }
 
-    /* calculate header checksums */
-    p->ip.chksum = ip_fast_csum((const void *)&p->ip, p->ip._v_hl);
-    p->tcp.chksum = tcp_csum(p->ip.src, p->ip.dest, len, IPPROTO_TCP, (uint8_t *)tcp);
+    /* calculate header checksums.
+     * HookShift: ip_fast_csum() takes the header length in 32-bit words (ihl),
+     * not the raw version+ihl byte (0x45 would checksum 276 bytes); tcp_csum()
+     * takes the TCP segment length, not the full frame length. Standard kernel
+     * peers validate these (eTran<->eTran never did, so both were latent). */
+    p->ip.chksum = ip_fast_csum((const void *)&p->ip, p->ip._v_hl & 0x0f);
+    p->tcp.chksum = tcp_csum(p->ip.src, p->ip.dest, len - offsetof(struct pkt_tcp, tcp),
+                             IPPROTO_TCP, (uint8_t *)tcp);
 
     /* send packet */
     slow_path_send_tcp(actx, p, len, false, c->qid);

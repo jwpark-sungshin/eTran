@@ -269,26 +269,40 @@ static __always_inline void fill_tcp_hdr(struct iphdr *iph, struct tcphdr *tcph,
     __u32 rx_wnd = c->rx_avail;
     __u32 ack_seq = c->rx_next_seq;
     __u32 ts_ecr = c->tx_next_ts;
-    struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)(tcph + 1);
-    if (ts_opt + 1 > data_end) {
+    /* HookShift: standard option layout [NOP][NOP][TS kind=8 len=10] so kernel
+     * TCP peers accept the segment. The old layout wrote the TS option at
+     * tcph+1 with kind=TCPI_OPT_TIMESTAMPS (=1, a tcp_info bitmask, i.e. NOP)
+     * and length=2 — garbage to a standard parser (latent in eTran<->eTran,
+     * which never parses option kinds). */
+    __u8 *opt = (__u8 *)(tcph + 1);
+    struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)(opt + 2);
+    if ((void *)(ts_opt + 1) > data_end) {
         return;
     }
     __u16 len = 5 + TS_OPT_SIZE / 4;
     /* fill tcp header */
     tcph->seq = bpf_htonl(tx_seq);
     tcph->ack_seq = bpf_htonl(ack_seq);
-    
+
     set_tcp_flag(tcph, len, flags);
 
-    ts_opt->kind = TCPI_OPT_TIMESTAMPS;
-    ts_opt->length = sizeof(*ts_opt) / 4;
+    opt[0] = 1; /* TCPOPT_NOP */
+    opt[1] = 1; /* TCPOPT_NOP */
+    ts_opt->kind = 8;    /* TCPOPT_TIMESTAMP */
+    ts_opt->length = 10; /* TCPOLEN_TIMESTAMP */
     ts_opt->ts_val = bpf_htonl(tgt_ts);
     ts_opt->ts_ecr = bpf_htonl(ts_ecr);
-    
-    tcph->window = bpf_htons(rx_wnd) >> TCP_WND_SCALE;
+
+    /* HookShift: shift before byte-swapping (the old order swapped first and
+     * shifted the big-endian value); clamp to 16 bits. */
+    {
+        __u32 wnd16 = rx_wnd >> TCP_WND_SCALE;
+        tcph->window = bpf_htons(wnd16 > 0xFFFF ? 0xFFFF : wnd16);
+    }
     tcph->urg_ptr = 0;
 
-    // Newer kernel has supported XDP_TXMD_FLAGS_CHECKSUM, ignore the overhead
+    /* HookShift: csum left to NIC L3/L4 offload (mlx5 cs_flags on XDP TX,
+     * see etran-on-6.6.142 kernel patch); kernel peers validate checksums. */
     tcph->check = 0;
 }
 
@@ -443,7 +457,9 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
 
     __u64 desired_tx_ts = cc_get_desired_tx_ts(cc, ref_ts, payload_len);
 
-    fill_tcp_hdr(iph, tcph, c, desired_tx_ts, data_end, 0);
+    /* HookShift: data segments must carry ACK (kernel peers discard
+     * established-state segments without it; eTran's own RX never checked). */
+    fill_tcp_hdr(iph, tcph, c, desired_tx_ts, data_end, TCP_FLAG_ACK | TCP_FLAG_PSH);
 
     fill_ip_hdr(iph, payload_len, c->ecn_enable);
 
@@ -654,7 +670,10 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
     __u32 payload_len = pkt_len - payload_off;
     __u32 seq = bpf_ntohl(tcph->seq);
     __u32 ack_seq = bpf_ntohl(tcph->ack_seq);
-    struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)(tcph + 1);
+    /* HookShift: standard [NOP][NOP][TS] layout — the TS option sits 2 NOPs
+     * past the TCP header (kernel peers always emit this layout; our TX now
+     * matches it too). Bounds were checked by the caller at the same offset. */
+    struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)((__u8 *)(tcph + 1) + 2);
     __u32 ts_val = bpf_ntohl(ts_opt->ts_val);
     __u32 ts_ecr = bpf_ntohl(ts_opt->ts_ecr);
 

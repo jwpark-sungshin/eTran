@@ -175,7 +175,8 @@ static void run_monitor(void)
     while (!force_quit)
     {
         sleep(1);
-        std::getline(std::cin, command);
+        if (!std::getline(std::cin, command))
+            continue; /* stdin closed (daemonized) — stay alive, no spam */
         if (command == "exit")
         {
             shutdown_monitor();

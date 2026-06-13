@@ -9,9 +9,8 @@
 #include "nic.h"
 #include "trans_ebpf.h"
 
-/* HookShift: TCP-only micro_kernel for the 3-way comparison (kernel-TCP/rbmc/eTran).
- * Comment this out to restore Homa. */
-#define HOOKSHIFT_TCP_ONLY 1
+/* HookShift: HOOKSHIFT_TCP_ONLY is defined in trans_ebpf.h (shared with
+ * control_plane.cc, which must also skip the Homa poller). */
 
 /* micro_kernel.cc */
 extern class eTranNIC *etran_nic;

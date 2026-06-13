@@ -90,8 +90,11 @@ int xdp_gen_prog(struct xdp_md *ctx)
         xdp_gen_log_panic("tcph + 1 > data_end");
         return XDP_ABORTED;
     }
-    ts_opt = (struct tcp_timestamp_opt *)(tcph + 1);
-    if (unlikely(ts_opt + 1 > data_end)) {
+    /* HookShift: standard option layout [NOP][NOP][TS kind=8 len=10] (see
+     * fill_tcp_hdr in tcp.h) so kernel peers accept the generated ACK. */
+    __u8 *opt = (__u8 *)(tcph + 1);
+    ts_opt = (struct tcp_timestamp_opt *)(opt + 2);
+    if (unlikely((void *)(ts_opt + 1) > data_end)) {
         xdp_gen_log_panic("ts_opt + 1 > data_end");
         return XDP_ABORTED;
     }
@@ -107,8 +110,10 @@ int xdp_gen_prog(struct xdp_md *ctx)
         return XDP_ABORTED;
     }
 
-    ts_opt->kind = TCPI_OPT_TIMESTAMPS;
-    ts_opt->length = sizeof(*ts_opt) / 4;
+    opt[0] = 1; /* TCPOPT_NOP */
+    opt[1] = 1; /* TCPOPT_NOP */
+    ts_opt->kind = 8;    /* TCPOPT_TIMESTAMP */
+    ts_opt->length = 10; /* TCPOLEN_TIMESTAMP */
     ts_opt->ts_val = bpf_htonl(ack->ts_val);
     ts_opt->ts_ecr = bpf_htonl(ack->ts_ecr);
     
@@ -335,8 +340,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
         goto slowpath;
     }
 
-    struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)(tcph + 1);
-    if (unlikely(ts_opt + 1 > data_end)) {
+    /* HookShift: TS option is at tcph+1 +2 NOPs (standard layout). Bound-check
+     * through the option end (tcp_rx_process reads it at the same offset). */
+    struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)((__u8 *)(tcph + 1) + 2);
+    if (unlikely((void *)(ts_opt + 1) > data_end)) {
         xdp_log_err("ts_opt + 1 > data_end");
         return XDP_DROP;
     }

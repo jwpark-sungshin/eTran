@@ -288,12 +288,18 @@ static inline uint16_t udp_csum(uint32_t saddr, uint32_t daddr, uint32_t len,
 static inline uint16_t tcp_csum(uint32_t saddr, uint32_t daddr, uint32_t len,
                 uint8_t proto, uint8_t *tcp_pkt)
 {
+    /* HookShift: sum native 16-bit words (network byte order in memory), the
+     * same convention csum_tcpudp_magic() expects and udp_csum() above uses.
+     * The old big-endian pairing produced checksums standard kernel TCP peers
+     * reject (eTran<->eTran never validates them, so this was latent). */
     uint32_t csum = 0;
     uint32_t cnt = 0;
 
     /* tcp hdr and data */
-    for (; cnt < len; cnt += 2)
-        csum += tcp_pkt[cnt] << 8 | tcp_pkt[cnt + 1];
+    for (; cnt + 1 < len; cnt += 2)
+        csum += *(uint16_t *)(tcp_pkt + cnt);
+    if (len & 1)
+        csum += tcp_pkt[len - 1];
 
     return csum_tcpudp_magic(saddr, daddr, len, proto, csum);
 }
