@@ -180,14 +180,21 @@ static inline bool wraps_gte(uint32_t a, uint32_t b)
 	do { typeof(a) _t = (a); (a) = (b); (b) = _t; } while(0)
 
 
+/* Guard: newer linux/stddef.h (6.6.142 UAPI) already defines __struct_group
+ * with a different body (uses __struct_group_tag()); prefer the kernel's to
+ * avoid a -Werror macro redefinition. */
+#ifndef __struct_group
 #define __struct_group(TAG, NAME, ATTRS, MEMBERS...) \
 	union { \
 		struct { MEMBERS } ATTRS; \
 		struct TAG { MEMBERS } ATTRS NAME; \
 	}
+#endif
 
+#ifndef struct_group_tagged
 #define struct_group_tagged(TAG, NAME, MEMBERS...) \
 	__struct_group(TAG, NAME, /* no attrs */, MEMBERS)
+#endif
 
 #define READ_ONCE(x)		(*(volatile typeof(x) *)&x)
 #define WRITE_ONCE(x, v)	(*(volatile typeof(x) *)&x) = (v)

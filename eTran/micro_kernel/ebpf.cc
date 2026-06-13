@@ -9,6 +9,10 @@
 #include "nic.h"
 #include "trans_ebpf.h"
 
+/* HookShift: TCP-only micro_kernel for the 3-way comparison (kernel-TCP/rbmc/eTran).
+ * Comment this out to restore Homa. */
+#define HOOKSHIFT_TCP_ONLY 1
+
 /* micro_kernel.cc */
 extern class eTranNIC *etran_nic;
 
@@ -185,13 +189,20 @@ int ebpf_init(void)
     INIT_CHECK(etran_tcp->load_ebpf_programs());
     INIT_CHECK(etran_tcp->init_ebpf_maps());
 
+    /* HookShift: TCP-only for the 3-way comparison; Homa unused. Its cpumap-prog
+     * attach (init_ebpf_maps -> bpf_map_update_elem cpumap) returns EPERM on
+     * 6.6.142-etran and is irrelevant to the TCP path. Skip Homa load/init/entrance. */
+#ifndef HOOKSHIFT_TCP_ONLY
     /* Load homa eBPF programs and initialize eBPF maps */
     INIT_CHECK(etran_homa->load_ebpf_programs());
     INIT_CHECK(etran_homa->init_ebpf_maps());
+#endif
 
     /* Add tcp and homa programs to entrance */
     INIT_CHECK(add_trans_to_entrance(etran_entrance, etran_tcp));
+#ifndef HOOKSHIFT_TCP_ONLY
     INIT_CHECK(add_trans_to_entrance(etran_entrance, etran_homa));
+#endif
 
     return 0;
 }
