@@ -127,6 +127,7 @@ struct eTrantcp_connection {
         xsk_budget = 0;
         qid = 0;
         status = CONN_CLOSED;
+        pending_free_bytes = 0;
         in_rx_bump_pending = false;
         force_rx_bump = false;
         s = nullptr;

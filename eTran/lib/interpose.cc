@@ -1,9 +1,14 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <errno.h>
 
 #include <eTran_posix.h>
 
@@ -18,6 +23,10 @@ int (*libc_connect)(int sockfd, const struct sockaddr *addr,
 int (*libc_listen)(int sockfd, int backlog) = nullptr;
 int (*libc_accept)(int sockfd, struct sockaddr *addr,
     socklen_t *addrlen) = nullptr;
+int (*libc_accept4)(int sockfd, struct sockaddr *addr,
+    socklen_t *addrlen, int flags) = nullptr;
+int (*libc_getpeername)(int fd, struct sockaddr *addr, socklen_t *addrlen) = nullptr;
+int (*libc_getsockname)(int fd, struct sockaddr *addr, socklen_t *addrlen) = nullptr;
 ssize_t (*libc_read)(int fd, void *buf, size_t count) = nullptr;
 ssize_t (*libc_write)(int fd, const void *buf, size_t count) = nullptr;
 int (*libc_setsockopt)(int socket, int level, int option_name,
@@ -27,6 +36,7 @@ int (*libc_getsockopt)(int socket, int level, int option_name,
 int (*libc_fcntl)(int fd, int cmd, ...);
 
 int (*libc_epoll_create1)(int flags) = nullptr;
+int (*libc_epoll_create)(int size) = nullptr;
 int (*libc_epoll_ctl)(int epfd, int op, int fd,
     struct epoll_event *event) = nullptr;
 int (*libc_epoll_wait)(int epfd, struct epoll_event *events,
@@ -50,6 +60,11 @@ static inline void init_socket() {
     INTERCEPT_FUNCTION(listen);
 
     INTERCEPT_FUNCTION(accept);
+
+    INTERCEPT_FUNCTION(accept4);
+
+    INTERCEPT_FUNCTION(getpeername);
+    INTERCEPT_FUNCTION(getsockname);
     
     INTERCEPT_FUNCTION(close);
 
@@ -64,6 +79,8 @@ static inline void init_socket() {
     INTERCEPT_FUNCTION(fcntl);
 
     INTERCEPT_FUNCTION(epoll_create1);
+
+    INTERCEPT_FUNCTION(epoll_create);
 
     INTERCEPT_FUNCTION(epoll_ctl);
 
@@ -134,6 +151,61 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     if (newfd < 0)
         return libc_accept(sockfd, addr, addrlen);
     return newfd;
+}
+
+int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
+    ensure_init();
+    int newfd;
+    if (unlikely(sockfd < 0))
+        return -EINVAL;
+    /* HookShift: Redis (and any epoll-driven server) calls accept4 with
+     * SOCK_NONBLOCK in a loop until EWOULDBLOCK. eTran_accept blocks (poll
+     * timeout -1) unless the LISTENER carries SOF_NONBLOCK, which hangs the
+     * whole event loop. Honor the accept4 flag by marking the listener
+     * non-blocking so eTran_accept polls non-blocking and returns EAGAIN. */
+    if (flags & SOCK_NONBLOCK)
+        eTran_fcntl(sockfd, F_SETFL, O_NONBLOCK);
+    newfd = eTran_accept(sockfd, addr, addrlen);
+    if (newfd == -EAGAIN) { errno = EAGAIN; return -1; }
+    if (newfd < 0)
+        return libc_accept4(sockfd, addr, addrlen, flags);
+    if (flags & SOCK_NONBLOCK)
+        eTran_fcntl(newfd, F_SETFL, O_NONBLOCK);
+    return newfd;
+}
+
+/* HookShift: eTran socket fds are eventfd-backed, so libc getpeername/getsockname
+ * return ENOTSOCK. Apps (Redis createClient) call these on accepted conns; fake a
+ * sockaddr_in success so they proceed. Real kernel fds fall through to libc. */
+static int fake_sockname(struct sockaddr *addr, socklen_t *addrlen)
+{
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    if (addr && addrlen) {
+        socklen_t n = *addrlen < (socklen_t)sizeof(sin) ? *addrlen : (socklen_t)sizeof(sin);
+        memcpy(addr, &sin, n);
+        *addrlen = sizeof(sin);
+    }
+    return 0;
+}
+
+int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    ensure_init();
+    int r = libc_getpeername(fd, addr, addrlen);
+    if (r < 0 && errno == ENOTSOCK)
+        return fake_sockname(addr, addrlen);
+    return r;
+}
+
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+    ensure_init();
+    int r = libc_getsockname(fd, addr, addrlen);
+    if (r < 0 && errno == ENOTSOCK)
+        return fake_sockname(addr, addrlen);
+    return r;
 }
 
 int close(int sockfd) {
@@ -223,12 +295,24 @@ int epoll_create1(int flags)
     return epfd;
 }
 
+int epoll_create(int size)
+{
+    int epfd;
+    ensure_init();
+
+    epfd = eTran_epoll_create1(0);
+    if (epfd <= 0)
+        return libc_epoll_create(size);
+    return epfd;
+}
+
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 {
     ensure_init();
     if (unlikely(epfd < 0))
         return -EINVAL;
-    if (eTran_epoll_ctl(epfd, op, fd, event))
+    int r = eTran_epoll_ctl(epfd, op, fd, event);
+    if (r)
         return libc_epoll_ctl(epfd, op, fd, event);
     return 0;
 }

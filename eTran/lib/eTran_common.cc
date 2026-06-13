@@ -1,6 +1,8 @@
 #include "eTran_common.h"
 
 #include <signal.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <base/ipc.h>
@@ -640,6 +642,11 @@ void pre_main(int argc, char *argv[])
         std::cout << "eTran init failed." << std::endl;
         exit(EXIT_FAILURE);
     }
+
+    /* HookShift: reserve this (main) thread's per-thread context now, so an app
+     * that creates its epoll before its first socket (e.g. Redis
+     * aeCreateEventLoop) gets a valid eTran tctx instead of a kernel epoll fd. */
+    eTran_get_tctx();
 }
 
 __attribute__((destructor))

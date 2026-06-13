@@ -259,6 +259,9 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     {
         if (unlikely(ooo_bump & OOO_CLEAR_MASK)) {
             /* clear out-of-order segments */
+            /* HookShift: return buffered OOO frames to the pool before dropping;
+             * the bare clear() leaked them from the UMEM pool under reordering. */
+            for (auto &_oa : conn->ooo_rx_addrs) thread_bcache_prod(bc, _oa.first);
             conn->ooo_rx_addrs.clear();
         }
 

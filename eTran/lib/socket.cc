@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <mutex>
@@ -1093,6 +1094,17 @@ int eTran_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     }
 #endif
 
+    /* HookShift: non-blocking accept fast path. eTran's accept is async (round
+     * trips to the microkernel), so polling for a non-existent connection spins.
+     * The listener's EPOLLIN tracks pending connections (set on NEWCONN, cleared
+     * on ACCEPT with empty backlog), so if it is clear there is nothing to accept
+     * -> return EAGAIN immediately (matches Redis's accept4-until-EWOULDBLOCK). */
+    if ((s->flags & SOF_NONBLOCK) && !(s->epoll_events & EPOLLIN))
+    {
+        errno = EAGAIN;
+        return -EAGAIN;
+    }
+
     newfd = alloc_socket_fd();
     if (newfd < 0)
     {
@@ -1136,7 +1148,11 @@ int eTran_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     socket_unlock(s);
     do
     {
-        if (socket_tcp_poll(tctx, 64, -1))
+        /* HookShift: a non-blocking listener must NOT block here. Redis's
+         * acceptTcpHandler loops accept4() until EWOULDBLOCK, so a blocking
+         * poll (timeout -1) with no pending connection hangs the whole event
+         * loop after the first accept. Poll non-blocking for SOF_NONBLOCK. */
+        if (socket_tcp_poll(tctx, 64, (s->flags & SOF_NONBLOCK) ? 0 : -1))
         {
             close(newfd);
             delete new_conn;
@@ -1150,8 +1166,8 @@ int eTran_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
         {
             close(newfd);
             delete new_conn;
-            errno = EIO;
-            ret = -EIO;
+            errno = EAGAIN;
+            ret = -EAGAIN;
             socket_lock(s);
             goto out;
         }
@@ -1164,6 +1180,12 @@ int eTran_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     ns->type = SOCKET_TYPE_CONNECTION;
     // new established connection should be writable, right?
     ns->epoll_events = EPOLLOUT;
+    /* HookShift: if the peer already sent data during/around accept (common for
+     * kernel-TCP clients like redis-cli that send the request immediately), the
+     * RX is buffered but the EPOLLIN edge would be lost by this assignment.
+     * Mark readable so epoll_ctl ADD / epoll_wait reports it. */
+    if (new_conn->rxb_used > 0)
+        ns->epoll_events |= EPOLLIN;
     new_conn->s = ns;
 
     return newfd;
@@ -1286,11 +1308,6 @@ ssize_t eTran_write(int fd, const void *buf, size_t count)
 int eTran_setsockopt(int socket, int level, int option_name,
                      const void *option_value, socklen_t option_len)
 {
-    if (level != SOL_SOCKET || (option_name != SO_REUSEPORT && option_name != SO_REUSEADDR))
-    {
-        return -EINVAL;
-    }
-
     struct eTran_socket_t *s = lookup_socket_with_fd(socket);
     if (!s)
     {
@@ -1302,19 +1319,30 @@ int eTran_setsockopt(int socket, int level, int option_name,
         return -EINVAL;
     }
 
-    if (option_len != sizeof(int))
+    /* HookShift: eTran socket fds are eventfd-backed, so any option we do not
+     * model must NOT fall through to libc -- libc setsockopt on an eventfd
+     * returns ENOTSOCK, which makes apps like Redis drop the just-accepted
+     * connection. Model SO_REUSEPORT/SO_REUSEADDR; silently accept everything
+     * else (TCP_NODELAY, SO_KEEPALIVE, ...) as a no-op success. */
+    if (level == SOL_SOCKET &&
+        (option_name == SO_REUSEPORT || option_name == SO_REUSEADDR))
     {
-        return -EINVAL;
+        if (option_len != sizeof(int))
+        {
+            return -EINVAL;
+        }
+        int *optval = (int *)option_value;
+        if (*optval != 0 && *optval != 1)
+        {
+            return -EINVAL;
+        }
+        socket_lock(s);
+        s->flags = static_cast<enum socket_flags>(
+            s->flags |
+            (option_name == SO_REUSEPORT ? SOF_REUSEPORT : 0) |
+            (option_name == SO_REUSEADDR ? SOF_REUSEADDR : 0));
+        socket_unlock(s);
     }
-
-    int *optval = (int *)option_value;
-    if (*optval != 0 && *optval != 1)
-    {
-        return -EINVAL;
-    }
-    socket_lock(s);
-    s->flags = static_cast<enum socket_flags>(s->flags | (option_name & SO_REUSEPORT ? SOF_REUSEPORT : 0 | (option_name & SO_REUSEADDR) ? SOF_REUSEADDR : 0));
-    socket_unlock(s);
 
     return 0;
 }
@@ -1589,6 +1617,14 @@ int eTran_epoll_wait(int epfd, struct epoll_event *events,
     {
         return -EIO;
     }
+
+
+    /* HookShift: eTran socket readiness is poll-based (socket_tcp_poll), not
+     * kernel-epoll wakeup. When eTran sockets are registered, blocking in the
+     * kernel epoll wait adds up to <timeout> ms latency per request. Poll
+     * non-blocking instead (eTran is a busy-poll system). */
+    if (ep->num_eTran > 0)
+        timeout = 0;
 
     // all fds are managed by linux
     if (!ep->num_eTran)
