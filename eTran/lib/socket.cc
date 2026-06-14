@@ -1,3 +1,4 @@
+#include <sys/uio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -1303,6 +1304,47 @@ ssize_t eTran_write(int fd, const void *buf, size_t count)
         socket_tcp_poll(tctx, 64, 0);
 
     return ret;
+}
+
+ssize_t eTran_writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    struct eTran_socket_t *s = lookup_socket_with_fd(fd);
+    if (unlikely(!s))
+        return -EBADF;
+    if (unlikely(s->protocol != IPPROTO_TCP)) { errno = EINVAL; return -EINVAL; }
+    struct app_ctx_per_thread *tctx = eTran_get_tctx();
+    if (unlikely(!tctx))
+        return -EINVAL;
+#ifndef SOCKET_MIGRATION
+    if (s->tctx != tctx)
+        return -EPERM;
+#endif
+    if (unlikely(s->type != SOCKET_TYPE_CONNECTION || s->status != S_CONN_CONNECTED))
+        return -EINVAL;
+
+    /* HookShift: Redis uses writev for large replies (proto header + big value).
+     * Gather each iovec through conn_send (zero-copy, multi-segment). Partial-write
+     * semantics like writev(2): return bytes sent so far; EAGAIN only if nothing sent. */
+    ssize_t total = 0;
+    bool polled = false;
+    for (int i = 0; i < iovcnt; i++) {
+        const uint8_t *base = (const uint8_t *)iov[i].iov_base;
+        size_t left = iov[i].iov_len;
+        while (left > 0) {
+            ssize_t r = conn_send(tctx, s->conn, base, left);
+            if (r > 0) { total += r; base += r; left -= (size_t)r; continue; }
+            /* r == 0: no tx budget right now */
+            if (total > 0) goto done;
+            if (s->flags & SOF_NONBLOCK) { errno = EAGAIN; total = -EAGAIN; goto done; }
+            socket_tcp_poll(tctx, 64, -1); polled = true;
+        }
+    }
+done:
+    if (txb_bytes_avail(s->conn) == 0)
+        clear_epoll_events(s, EPOLLOUT);
+    if (!polled)
+        socket_tcp_poll(tctx, 64, 0);
+    return total;
 }
 
 int eTran_setsockopt(int socket, int level, int option_name,

@@ -1,4 +1,5 @@
 #pragma once
+#include <sys/uio.h>
 
 #include <app_if.h>
 #include <xsk_if.h>
@@ -23,6 +24,7 @@ extern int eTran_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 extern int eTran_close(int sockfd);
 extern ssize_t eTran_read(int fd, void *buf, size_t count);
 extern ssize_t eTran_write(int fd, const void *buf, size_t count);
+extern ssize_t eTran_writev(int fd, const struct iovec *iov, int iovcnt);
 extern int eTran_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
 extern int eTran_getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
 extern int eTran_fcntl(int fd, int cmd, int flags);

@@ -1,5 +1,6 @@
 #include <dlfcn.h>
 #include <unistd.h>
+#include <sys/uio.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -29,6 +30,7 @@ int (*libc_getpeername)(int fd, struct sockaddr *addr, socklen_t *addrlen) = nul
 int (*libc_getsockname)(int fd, struct sockaddr *addr, socklen_t *addrlen) = nullptr;
 ssize_t (*libc_read)(int fd, void *buf, size_t count) = nullptr;
 ssize_t (*libc_write)(int fd, const void *buf, size_t count) = nullptr;
+ssize_t (*libc_writev)(int fd, const struct iovec *iov, int iovcnt) = nullptr;
 int (*libc_setsockopt)(int socket, int level, int option_name,
            const void *option_value, socklen_t option_len);
 int (*libc_getsockopt)(int socket, int level, int option_name,
@@ -71,6 +73,7 @@ static inline void init_socket() {
     INTERCEPT_FUNCTION(read);
     
     INTERCEPT_FUNCTION(write);
+    INTERCEPT_FUNCTION(writev);
 
     INTERCEPT_FUNCTION(setsockopt);
 
@@ -228,6 +231,19 @@ ssize_t read(int fd, void *buf, size_t count)
     if (ret < 0) {
         return libc_read(fd, buf, count);
     }
+    return ret;
+}
+
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    ensure_init();
+    ssize_t ret;
+    if (unlikely(fd < 0))
+        return -EINVAL;
+    ret = eTran_writev(fd, iov, iovcnt);
+    if (ret == -EBADF)
+        return libc_writev(fd, iov, iovcnt);
+    if (ret < 0) { errno = -ret; return -1; }
     return ret;
 }
 

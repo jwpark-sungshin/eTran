@@ -226,7 +226,7 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
             break;
         }
 
-        ts_opt = bpf_dynptr_slice_rdwr(&ptr, sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr),
+        ts_opt = bpf_dynptr_slice_rdwr(&ptr, sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + 2 /* [NOP][NOP] before TS, matches fill_tcp_hdr layout */,
                             NULL, sizeof(*ts_opt));
         if (unlikely(!ts_opt)) {
             log_panic("bpf_dynptr_slice_rdwr failed");
