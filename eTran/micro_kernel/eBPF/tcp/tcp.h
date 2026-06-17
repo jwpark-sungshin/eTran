@@ -662,7 +662,7 @@ static __always_inline int tcp_valid_rxseq(struct bpf_tcp_conn *c, __u32 seq, __
     return 0;
 }
 
-static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_conn *c, __u32 pkt_len, struct meta_info *data_meta, bool ece, __u32 cpu)
+static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_conn *c, __u32 pkt_len, struct meta_info *data_meta, bool ece, __u32 cpu, bool cache_hit)
 {
     bool trigger_ack = false;
     __u32 go_back_pos = 0;
@@ -932,7 +932,7 @@ unlock:
 
 out:
 
-    if (trigger_ack) {
+    if (trigger_ack && !cache_hit) {
         // TODO
         xdp_log("trigger_ack");
         #ifdef ACK_COALESCING
@@ -953,6 +953,9 @@ out:
     }
     TCP_UNLOCK(c);
 
+    /* rbmc-xdp: in-order GET hit consumed → signal caller to build+XDP_TX reply */
+    if (cache_hit && !drop)
+        return XDP_TX;
     return drop ? XDP_DROP : XDP_REDIRECT;
 }
 

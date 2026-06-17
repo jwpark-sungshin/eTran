@@ -14,6 +14,9 @@
 #include "../ebpf_utils.h"
 #include "eTran_defs.h"
 #include "tcp.h"
+#ifdef RBMC_XDP
+#include "rbmc_xdp.h"
+#endif
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -224,6 +227,17 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto err_pkt;
     }
 
+#ifdef RBMC_XDP
+    /* learn-on-miss: snoop the Redis-over-eTran response to fill the cache
+     * (before tcp_tx_process stamps the header; payload is the RESP reply). */
+    {
+        int rbmc_plen = (int)(data_end - data) - (int)RBMC_PAYLOAD_OFF;
+        /* only first-time data responses learn; skip retransmits (FLAG_TO) */
+        if (rbmc_plen > 0 && !(data_meta->tx.flag & FLAG_TO))
+            rbmc_xdp_fill(ctx, data, data_end, &key, (__u32)rbmc_plen);
+    }
+#endif
+
     ret = tcp_tx_process(iph, tcph, c, data_meta, data_end);
 
     if (ret == XDP_DROP) {
@@ -368,8 +382,26 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     data_meta->rx.conn = c->opaque_connection;
 
-    ret = tcp_rx_process(tcph, c, pkt_len, data_meta, (iph->tos & IPTOS_ECN_CE) == IPTOS_ECN_CE, cpu);
-    
+    bool ece = (iph->tos & IPTOS_ECN_CE) == IPTOS_ECN_CE;
+#ifdef RBMC_XDP
+    __u32 rbmc_rlen = 0;
+    bool rbmc_hit = rbmc_xdp_classify(data, data_end, &key, &rbmc_rlen) == RBMC_SERVE_HIT;
+    /* v1 quiescence guard: only serve a hit when this packet fully ACKs prior
+     * lib TX (ack_seq == tx_next_seq) and nothing is pending — then the served
+     * reply (which advances ONLY tx_next_seq) leaves tx_sent==0, so the client's
+     * reply-ACK yields tx_bump==0 and never desyncs the lib's tx accounting.
+     * Otherwise fall through: Redis answers (cache still holds it for next time). */
+    if (rbmc_hit && !(tcph->ack && bpf_ntohl(tcph->ack_seq) == c->tx_next_seq && c->tx_pending == 0))
+        rbmc_hit = false;
+    ret = tcp_rx_process(tcph, c, pkt_len, data_meta, ece, cpu, rbmc_hit);
+    if (ret == XDP_TX) {
+        /* GET hit: request consumed in-order, build reply in-frame + XDP_TX */
+        return rbmc_xdp_build_reply(ctx, c, rbmc_rlen);
+    }
+#else
+    ret = tcp_rx_process(tcph, c, pkt_len, data_meta, ece, cpu, false);
+#endif
+
     if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
         return bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
     }
