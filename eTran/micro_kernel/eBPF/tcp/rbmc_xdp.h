@@ -467,6 +467,109 @@ static __always_inline int rbmc_xdp_enqueue_serve(struct bpf_tcp_conn *c,
 	return XDP_DROP;
 }
 
+#ifdef RBMC_XDP_V2
+/*
+ * v2 IN-PLACE serve (BMC-style, the cleanest path): rewrite the request frame
+ * itself into the reply and XDP_TX it — zero userspace touch, single frame, no
+ * deferral. Called from xdp_sock_prog ONLY when the served GET does not ACK any
+ * lib TX (tx_bump==0); a GET that acks a prior +OK falls back to the v1
+ * enqueue_serve+redirect path (which forwards the ack to the lib). Reply bytes
+ * are in the per-CPU scratch (from classify, same packet).
+ *
+ * REQUIRES the v2 kernel patch (mlx5 RX-path XDP_TX → recycle the frame to the
+ * fill ring on TX completion). WITHOUT that patch this LEAKS the UMEM frame
+ * (eTran's cq-drain is gated on `outstanding`, which pure GET-hits never bump)
+ * — that leak is exactly why v1 routes through XDP_GEN instead. Do NOT run a
+ * -DRBMC_XDP_V2 build on an unpatched kernel.
+ */
+static __always_inline int rbmc_xdp_build_reply_inplace(struct xdp_md *ctx,
+							struct bpf_tcp_conn *c,
+							__u32 reply_len)
+{
+	struct rbmc_xdp_stats *st = rbmc_xdp_stats();
+	struct rbmc_xdp_scratch *sc;
+	void *data, *data_end;
+	struct ethhdr *eth;
+	struct iphdr *iph;
+	struct tcphdr *tcph;
+	__u32 z = 0, rlen = reply_len;
+	int cur, target, dlen, j;
+	__u64 ts;
+
+	sc = bpf_map_lookup_elem(&rbmc_xdp_scratch_map, &z);
+	if (!sc)
+		return XDP_DROP;
+
+	barrier_var(rlen);
+	if (rlen < 4)
+		rlen = 4;
+	if (rlen > RBMC_MAX_REPLY_LEN)
+		rlen = RBMC_MAX_REPLY_LEN;
+
+	cur = (int)(ctx->data_end - ctx->data);
+	target = (int)RBMC_PAYLOAD_OFF + (int)rlen;
+	dlen = target - cur;
+	if (bpf_xdp_adjust_tail(ctx, dlen)) {
+		RBMC_STAT(st, grow_fail);
+		return XDP_DROP;
+	}
+
+	data = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+	eth = (struct ethhdr *)data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+	iph = (struct iphdr *)(eth + 1);
+	if ((void *)(iph + 1) > data_end)
+		return XDP_DROP;
+	tcph = (struct tcphdr *)(iph + 1);
+	{
+		struct tcp_timestamp_opt *ts_opt =
+			(struct tcp_timestamp_opt *)((__u8 *)(tcph + 1) + 2);
+		if ((void *)(ts_opt + 1) > data_end)
+			return XDP_DROP;
+	}
+
+	/* swap addresses/ports to reflect the response (server -> client) */
+	iph->saddr = bpf_htonl(c->local_ip);
+	iph->daddr = bpf_htonl(c->remote_ip);
+	tcph->source = bpf_htons(c->local_port);
+	tcph->dest = bpf_htons(c->remote_port);
+
+	{
+		char *pl = (char *)data + RBMC_PAYLOAD_OFF;
+		barrier_var(rlen);
+		if (rlen < 4)
+			rlen = 4;
+		if (rlen > RBMC_MAX_REPLY_LEN)
+			rlen = RBMC_MAX_REPLY_LEN;
+		if (pl + rlen > (char *)data_end)
+			return XDP_DROP;
+#pragma clang loop unroll(disable)
+		for (j = 0; j < RBMC_REPLY_BUF_LEN && j < (int)rlen &&
+			    pl + j + 1 <= (char *)data_end; j++)
+			pl[j] = sc->reply[j];
+	}
+
+	ts = bpf_ktime_get_ns();
+
+	/* eTran owns seq. v1 seq-coherence: advance ONLY tx_next_seq (this path
+	 * runs only when tx_bump==0, so the lib's tx accounting is undisturbed). */
+	TCP_LOCK(c);
+	fill_tcp_hdr(iph, tcph, c, ts, data_end, TCP_FLAG_ACK | TCP_FLAG_PSH);
+	fill_ip_hdr(iph, rlen, c->ecn_enable);
+	c->tx_next_seq += rlen;
+	TCP_UNLOCK(c);
+
+	eth->h_proto = bpf_htons(ETH_P_IP);
+	__builtin_memcpy(eth->h_dest, c->remote_mac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, c->local_mac, ETH_ALEN);
+
+	RBMC_STAT(st, serve_xdp);
+	return XDP_TX;   /* kernel patch recycles this frame to the fill ring */
+}
+#endif /* RBMC_XDP_V2 */
+
 /*
  * learn-on-miss: snoop a Redis-over-eTran GET response on the egress path and
  * populate the cache for the pending miss recorded on ingress. Called from

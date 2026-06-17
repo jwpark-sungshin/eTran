@@ -113,6 +113,15 @@ __u32 ack_prod[MAX_CPU];
 SEC(".bss.ack_cons")
 __u32 ack_cons[MAX_CPU];
 
+#ifdef RBMC_XDP_V2
+/* v2: per-CPU one-shot flag — tcp_rx_process sets it on a cache hit to tell
+ * xdp_sock_prog whether to serve IN-PLACE (1, frame→reply XDP_TX, zero lib
+ * touch) or fall back to the v1 enqueue_serve+redirect path (0, when the hit
+ * acks prior lib TX). Same-CPU, same-packet → no race. */
+SEC(".bss.serve_inplace")
+__u8 serve_inplace[MAX_CPU];
+#endif
+
 SEC(".bss.tx_cached_ts")
 __u64 tx_cached_ts[MAX_CPU];
 
@@ -894,6 +903,16 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
              * POISON so the lib's sync_state is a no-op. */
             c->rx_next_seq += payload_len;
             served = true;
+#ifdef RBMC_XDP_V2
+            /* v2: if this hit ACKs no lib TX, serve IN-PLACE (the frame becomes
+             * the reply, XDP_TX'd by xdp_sock_prog — zero userspace touch). A
+             * hit that acks a prior +OK (tx_bump>0) falls through to the v1
+             * redirect path below so the ack still reaches the lib. */
+            if (likely(cpu < MAX_CPU))
+                serve_inplace[cpu] = (tx_bump == 0);
+            if (tx_bump == 0)
+                goto out;
+#endif
             /* CRITICAL: a served GET can still ACK prior lib TX (e.g. a SET's
              * +OK) — the quiescence guard only requires ack_seq==tx_next_seq,
              * and tx_next_seq includes that +OK. Forward the ack (tx_bump) to the

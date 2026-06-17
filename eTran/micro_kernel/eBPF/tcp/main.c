@@ -443,12 +443,18 @@ int xdp_sock_prog(struct xdp_md *ctx)
         rbmc_hit = false;
     ret = tcp_rx_process(tcph, c, pkt_len, data_meta, ece, cpu, rbmc_hit);
     if (ret == XDP_TX) {
-        /* GET hit consumed in-order: enqueue the reply for the XDP_GEN path, then
-         * REDIRECT the (now no-payload) request frame to the lib. The redirect is
-         * what triggers run_xdp_gen this batch (gen runs only on an xsk flush), so
-         * the serve reply is emitted promptly; the lib just recycles the frame
-         * (plen=POISON → no app delivery). The reply itself is a fresh,
-         * kernel-recycled gen frame — no UMEM/fill-ring leak. */
+#ifdef RBMC_XDP_V2
+        /* v2 fast path (tx_bump==0): rewrite the request frame into the reply
+         * in-place and XDP_TX it — zero userspace touch, single frame, sync.
+         * Requires the v2 kernel patch (recycle RX-path XDP_TX to the fill ring). */
+        if (likely(cpu < MAX_CPU) && serve_inplace[cpu])
+            return rbmc_xdp_build_reply_inplace(ctx, c, rbmc_rlen);
+#endif
+        /* v1 / v2-fallback: GET hit consumed in-order — enqueue the reply for the
+         * XDP_GEN path, then REDIRECT the (payload-poisoned) request frame to the
+         * lib. The redirect triggers run_xdp_gen this batch (gen runs only on an
+         * xsk flush) so the reply is emitted promptly; the lib recycles the frame
+         * without app delivery. The reply is a fresh, kernel-recycled gen frame. */
         rbmc_xdp_enqueue_serve(c, cpu, rbmc_rlen);
         if (likely(qid < MAX_NIC_QUEUES))
             return bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
