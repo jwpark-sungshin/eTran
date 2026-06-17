@@ -68,6 +68,18 @@ struct {
 
 // ACK
 // emulate a per-cpu SCSP queue with BPF_MAP_TYPE_PERCPU_ARRAY
+#ifdef RBMC_XDP
+/* rbmc-xdp serves GET cache hits through the XDP_GEN path: a SERVE entry is a
+ * normal ACK plus a snapshot of the reply bytes. Snapshotting at enqueue time
+ * (RX) keeps the served value correct even if a later packet in the same NAPI
+ * batch mutates the cache slot before xdp_gen runs (deferred). Must match
+ * rbmc_xdp.h's RBMC_REPLY_BUF_LEN (guarded there too). */
+#ifndef RBMC_REPLY_BUF_LEN
+#define RBMC_REPLY_BUF_LEN 1016
+#endif
+#define BPF_TCP_ACK_TYPE_ACK   0
+#define BPF_TCP_ACK_TYPE_SERVE 1
+#endif
 struct bpf_tcp_ack {
     __u32 local_ip;
     __u32 remote_ip;
@@ -82,6 +94,11 @@ struct bpf_tcp_ack {
     __u32 ts_ecr; // tx_next_ts
 
     __u8 ecn_flags;
+#ifdef RBMC_XDP
+    __u8 type;        /* BPF_TCP_ACK_TYPE_{ACK,SERVE} */
+    __u16 reply_len;  /* SERVE: response payload bytes following the TCP header */
+    char reply[RBMC_REPLY_BUF_LEN] __attribute__((aligned(8)));
+#endif
 };
 
 struct {
@@ -190,6 +207,9 @@ static __always_inline int enqueue_prev_ack(__u32 cpu)
     TCP_UNLOCK(c);
 
     ack->ecn_flags = ece ? 1 : 0;
+#ifdef RBMC_XDP
+    ack->type = BPF_TCP_ACK_TYPE_ACK;
+#endif
 
     ack_prod[cpu] = (prod + 1) & (NAPI_BATCH_SIZE - 1);
 
@@ -213,6 +233,9 @@ static __always_inline int enqueue_ack(struct bpf_tcp_conn *c, struct bpf_tcp_ac
     c->tx_next_ts = 0;
 
     ack->ecn_flags = ece ? 1 : 0;
+#ifdef RBMC_XDP
+    ack->type = BPF_TCP_ACK_TYPE_ACK;
+#endif
 
     ack_prod[cpu] = (ack_prod[cpu] + 1) & (NAPI_BATCH_SIZE - 1);
 
@@ -684,6 +707,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 
     __u32 now = 0;
     bool drop = true;
+    bool served = false; /* rbmc-xdp: in-order GET hit validly consumed → serve */
     #ifndef ACK_COALESCING
     struct bpf_tcp_ack *ack = NULL;
     #endif
@@ -852,6 +876,44 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 
     /* update TCP state if we have payload */
     if (likely(payload_len)) {
+#ifdef RBMC_XDP
+        if (cache_hit) {
+            /* GET hit served in XDP: ACK the request bytes (advance rx_next_seq)
+             * but consume NO app buffer — answered in-kernel, never delivered to
+             * the app, so the lib never issues a matching rx_bump. Leaving
+             * rx_avail / rx_next_pos untouched avoids draining the advertised
+             * receive window (and the app RX ring).
+             *
+             * Then mark the frame as a no-payload event (plen=POISON) and REDIRECT
+             * it (drop=false): the lib recycles it without delivering to the app,
+             * and — crucially — the XDP_REDIRECT puts this xsk on the gen flush
+             * list, so run_xdp_gen fires THIS NAPI batch and emits the queued
+             * serve reply promptly. (gen runs only on an xsk-redirect flush; a
+             * bare XDP_DROP would strand the reply in the queue until the next
+             * redirected packet → per-op RTO stalls.) All other rx metadata stays
+             * POISON so the lib's sync_state is a no-op. */
+            c->rx_next_seq += payload_len;
+            served = true;
+            /* CRITICAL: a served GET can still ACK prior lib TX (e.g. a SET's
+             * +OK) — the quiescence guard only requires ack_seq==tx_next_seq,
+             * and tx_next_seq includes that +OK. Forward the ack (tx_bump) to the
+             * lib even though we poison the payload; otherwise the lib never
+             * frees the +OK frame and its unack_tx_addrs/txb_sent/
+             * pending_free_bytes desync from the XDP layer → tcp_free_buffers
+             * pops an empty/short unack list → heap corruption. (sync_state runs
+             * for this frame before the plen==POISON recycle.) tx_bump < the
+             * RECOVERY_MASK bit, so the lib's go_back_pos branch (same union
+             * offset) stays inactive. */
+            if (tx_bump)
+                data_meta->rx.ack_bytes = tx_bump;
+            data_meta->rx.rx_pos = POISON_32;
+            data_meta->rx.poff = POISON_16;
+            data_meta->rx.plen = POISON_16;
+            data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
+            drop = false;
+            goto out;
+        }
+#endif
         rx_bump = payload_len;
         c->rx_avail -= payload_len;
         c->rx_next_pos += payload_len;
@@ -953,8 +1015,10 @@ out:
     }
     TCP_UNLOCK(c);
 
-    /* rbmc-xdp: in-order GET hit consumed → signal caller to build+XDP_TX reply */
-    if (cache_hit && !drop)
+    /* rbmc-xdp: in-order GET hit validly consumed → signal caller to enqueue a
+     * SERVE for the XDP_GEN path (returns XDP_TX as the internal serve signal;
+     * the caller turns it into an XDP_DROP of the request frame + a gen reply). */
+    if (served)
         return XDP_TX;
     return drop ? XDP_DROP : XDP_REDIRECT;
 }

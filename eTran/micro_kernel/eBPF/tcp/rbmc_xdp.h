@@ -35,7 +35,12 @@
 #define RBMC_REPLY_BUF_LEN 1016 /* 8B aligned + slack */
 
 #define RBMC_DEFAULT_PORT          6379
-#define RBMC_CACHE_ENTRIES_DEFAULT 65536 /* 2^16; loader overrides mask for hit-ratio */
+/* cache entries = direct-mapped slots; hit ratio is controlled by this size
+ * relative to the keyspace (learn-on-miss fills it). Must be a power of two.
+ * Override per hit-ratio-sweep point: -DRBMC_CACHE_ENTRIES_DEFAULT=N */
+#ifndef RBMC_CACHE_ENTRIES_DEFAULT
+#define RBMC_CACHE_ENTRIES_DEFAULT 65536 /* 2^16 default (>10k keyspace → ~100% hit) */
+#endif
 
 #define FNV_OFFSET_BASIS_32 2166136261u
 #define FNV_PRIME_32        16777619u
@@ -370,24 +375,49 @@ static __always_inline int rbmc_xdp_classify(void *data, void *data_end,
 }
 
 /*
- * Build the cache-hit reply in the request frame and XDP_TX it. Called from
- * xdp_sock_prog AFTER tcp_rx_process has validated+consumed the request (so
- * c->rx_next_seq is advanced). Reply bytes are in the per-CPU scratch.
+ * Is there room in this CPU's ACK/SERVE queue to enqueue a serve? Reserve a
+ * 2-slot margin (one for the serve, one for the deferred prev_conn ACK that
+ * xdp_gen flushes at batch end). If the queue is near full (heavy multi-conn
+ * batches), the caller declines the hit and lets Redis answer — the cache still
+ * holds the value for next time, so a request is never stranded.
  */
-static __always_inline int rbmc_xdp_build_reply(struct xdp_md *ctx,
-						struct bpf_tcp_conn *c,
-						__u32 reply_len)
+static __always_inline int rbmc_xdp_ack_room(__u32 cpu)
+{
+	__u32 used;
+	if (cpu >= MAX_CPU)
+		return 0;
+	used = (ack_prod[cpu] - ack_cons[cpu]) & (NAPI_BATCH_SIZE - 1);
+	return used + 2 < NAPI_BATCH_SIZE;
+}
+
+/*
+ * Enqueue a GET cache-hit SERVE into this CPU's ACK queue for the XDP_GEN path.
+ * Called from xdp_sock_prog AFTER tcp_rx_process has validated+consumed the
+ * request (rx_next_seq advanced). The reply bytes are in the per-CPU scratch;
+ * we snapshot them (and seq/ack) into the queue entry NOW, because xdp_gen runs
+ * deferred (batch end) and the cache slot may be mutated by a later packet in
+ * the same batch. v1 seq-coherence: advance ONLY c->tx_next_seq — the served
+ * bytes stay invisible to the lib's tx accounting (unack_tx_addrs/tx_sent), so
+ * the client's reply-ACK yields tx_bump==0 and never desyncs it.
+ *
+ * Only enqueues — the caller (xdp_sock_prog) REDIRECTS the consumed request
+ * frame to the lib (which triggers run_xdp_gen this batch and recycles the
+ * frame). The reply is emitted by xdp_gen_prog from a FRESH page-pool frame that
+ * the kernel auto-recycles after TX — no UMEM/fill-ring leak (the bug the old
+ * in-place XDP_TX serve hit: that frame was never returned to the pool). Return
+ * value is unused by the caller.
+ */
+static __always_inline int rbmc_xdp_enqueue_serve(struct bpf_tcp_conn *c,
+						  __u32 cpu, __u32 reply_len)
 {
 	struct rbmc_xdp_stats *st = rbmc_xdp_stats();
 	struct rbmc_xdp_scratch *sc;
-	void *data, *data_end;
-	struct ethhdr *eth;
-	struct iphdr *iph;
-	struct tcphdr *tcph;
-	__u32 z = 0, rlen = reply_len;
-	int cur, target, dlen, j;
-	__u64 ts;
+	struct bpf_tcp_ack *ack;
+	__u32 z = 0, prod, now, wnd, rlen = reply_len;
+	int j;
 
+	if (cpu >= MAX_CPU)
+		return XDP_DROP;
 	sc = bpf_map_lookup_elem(&rbmc_xdp_scratch_map, &z);
 	if (!sc)
 		return XDP_DROP;
@@ -398,69 +428,43 @@ static __always_inline int rbmc_xdp_build_reply(struct xdp_md *ctx,
 	if (rlen > RBMC_MAX_REPLY_LEN)
 		rlen = RBMC_MAX_REPLY_LEN;
 
-	cur = (int)(ctx->data_end - ctx->data);
-	target = (int)RBMC_PAYLOAD_OFF + (int)rlen;
-	dlen = target - cur;
-	if (bpf_xdp_adjust_tail(ctx, dlen)) {
-		RBMC_STAT(st, grow_fail);
+	prod = ack_prod[cpu];
+	ack = bpf_map_lookup_elem(&bpf_tcp_ack_map, &prod);
+	if (!ack)
 		return XDP_DROP;
-	}
 
-	data = (void *)(long)ctx->data;
-	data_end = (void *)(long)ctx->data_end;
-	eth = (struct ethhdr *)data;
-	if ((void *)(eth + 1) > data_end)
-		return XDP_DROP;
-	iph = (struct iphdr *)(eth + 1);
-	if ((void *)(iph + 1) > data_end)
-		return XDP_DROP;
-	tcph = (struct tcphdr *)(iph + 1);
-	/* need TCP hdr + [NOP NOP TS] + reply present */
-	{
-		struct tcp_timestamp_opt *ts_opt =
-			(struct tcp_timestamp_opt *)((__u8 *)(tcph + 1) + 2);
-		if ((void *)(ts_opt + 1) > data_end)
-			return XDP_DROP;
-	}
+	/* compute the timestamp and all map lookups BEFORE the spin lock — helpers
+	 * are forbidden while holding a bpf_spin_lock. */
+	now = (__u32)bpf_ktime_get_ns();
 
-	/* swap addresses/ports to reflect the response (server -> client) */
-	iph->saddr = bpf_htonl(c->local_ip);
-	iph->daddr = bpf_htonl(c->remote_ip);
-	tcph->source = bpf_htons(c->local_port);
-	tcph->dest = bpf_htons(c->remote_port);
-
-	/* copy reply into payload (constant-size, bounded) */
-	{
-		char *pl = (char *)data + RBMC_PAYLOAD_OFF;
-		barrier_var(rlen);
-		if (rlen < 4)
-			rlen = 4;
-		if (rlen > RBMC_MAX_REPLY_LEN)
-			rlen = RBMC_MAX_REPLY_LEN;
-		if (pl + rlen > (char *)data_end)
-			return XDP_DROP;
-#pragma clang loop unroll(disable)
-		for (j = 0; j < RBMC_REPLY_BUF_LEN && j < (int)rlen &&
-			    pl + j + 1 <= (char *)data_end; j++)
-			pl[j] = sc->reply[j];
-	}
-
-	ts = bpf_ktime_get_ns();
-
-	/* eTran owns seq: fill_tcp_hdr uses c->tx_next_seq / c->rx_next_seq.
-	 * v1: advance ONLY tx_next_seq (served bytes invisible to lib accounting). */
 	TCP_LOCK(c);
-	fill_tcp_hdr(iph, tcph, c, ts, data_end, TCP_FLAG_ACK | TCP_FLAG_PSH);
-	fill_ip_hdr(iph, rlen, c->ecn_enable);
-	c->tx_next_seq += rlen;
+	ack->local_ip = c->local_ip;
+	ack->remote_ip = c->remote_ip;
+	ack->local_port = c->local_port;
+	ack->remote_port = c->remote_port;
+	ack->seq = c->tx_next_seq;   /* reply data starts at the current snd_nxt */
+	ack->ack = c->rx_next_seq;   /* acks the GET request just consumed */
+	wnd = c->rx_avail >> TCP_WND_SCALE;
+	ack->rxwnd = wnd > 0xFFFF ? 0xFFFF : wnd;
+	ack->ts_val = now;
+	ack->ts_ecr = c->tx_next_ts;
+	c->tx_next_ts = 0;
+	c->tx_next_seq += rlen;      /* v1: advance ONLY tx_next_seq */
 	TCP_UNLOCK(c);
 
-	eth->h_proto = bpf_htons(ETH_P_IP);
-	__builtin_memcpy(eth->h_dest, c->remote_mac, ETH_ALEN);
-	__builtin_memcpy(eth->h_source, c->local_mac, ETH_ALEN);
+	ack->ecn_flags = 0;
+	ack->reply_len = (__u16)rlen;
+	/* constant-size copy (verifier-friendly); gen emits only reply_len bytes */
+#pragma clang loop unroll(disable)
+	for (j = 0; j + 8 <= RBMC_REPLY_BUF_LEN; j += 8)
+		*(__u64 *)(ack->reply + j) = *(__u64 *)(sc->reply + j);
+	ack->type = BPF_TCP_ACK_TYPE_SERVE;
+
+	/* publish to the consumer (xdp_gen) only after the entry is fully built */
+	ack_prod[cpu] = (prod + 1) & (NAPI_BATCH_SIZE - 1);
 
 	RBMC_STAT(st, serve_xdp);
-	return XDP_TX;
+	return XDP_DROP;
 }
 
 /*

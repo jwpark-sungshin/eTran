@@ -50,6 +50,14 @@ int xdp_gen_prog(struct xdp_md *ctx)
     struct bpf_tcp_ack *ack;
     void *data, *data_end;
     int err = 0;
+    /* header-only by default (a bare ACK); an rbmc SERVE grows the frame to
+     * carry the response payload. */
+    int target = (int)(sizeof(struct ethhdr) + sizeof(struct iphdr) +
+                       sizeof(struct tcphdr) + TS_OPT_SIZE);
+    __u8 psh = 0;
+#ifdef RBMC_XDP
+    __u16 rlen = 0;
+#endif
 
     __u32 cpu = bpf_get_smp_processor_id();
 
@@ -70,7 +78,33 @@ int xdp_gen_prog(struct xdp_md *ctx)
 
     xdp_gen_log("XDP_GEN at CPU#%u", cpu);
 
-    if (unlikely(err = bpf_xdp_adjust_tail(ctx, -TCP_ACK_HEADER_CUTOFF))) {
+    /* dequeue BEFORE sizing the frame: a SERVE entry needs a larger frame than
+     * a bare ACK, and we only know the type after dequeue. */
+    if (ackqueue_empty()) {
+        xdp_gen_log("ackqueue is empty");
+        return XDP_ABORTED;
+    }
+
+    ack = dequeue_ack();
+    if (unlikely(!ack)) {
+        xdp_gen_log_panic("dequeue_ack failed");
+        return XDP_ABORTED;
+    }
+
+#ifdef RBMC_XDP
+    if (ack->type == BPF_TCP_ACK_TYPE_SERVE) {
+        rlen = ack->reply_len;
+        if (rlen > RBMC_MAX_REPLY_LEN)
+            rlen = RBMC_MAX_REPLY_LEN;
+        target += rlen;
+        psh = 1;
+    }
+#endif
+
+    /* size the frame: shrink to header-only for an ACK, grow for a SERVE. The
+     * gen frame enters at XDP_GEN_PKT_SIZE and frame_sz spans most of a page, so
+     * a reply (<= RBMC_MAX_REPLY_LEN) fits with room to spare. */
+    if (unlikely(err = bpf_xdp_adjust_tail(ctx, target - (int)XDP_GEN_PKT_SIZE))) {
         xdp_gen_log_panic("bpf_xdp_adjust_tail failed: %d", err);
         return XDP_ABORTED;
     }
@@ -102,29 +136,18 @@ int xdp_gen_prog(struct xdp_md *ctx)
         return XDP_ABORTED;
     }
 
-    if (ackqueue_empty()) {
-        xdp_gen_log("ackqueue is empty");
-        return XDP_ABORTED;
-    }
-
-    ack = dequeue_ack();
-    if (unlikely(!ack)) {
-        xdp_gen_log_panic("dequeue_ack failed");
-        return XDP_ABORTED;
-    }
-
     opt[0] = 1; /* TCPOPT_NOP */
     opt[1] = 1; /* TCPOPT_NOP */
     ts_opt->kind = 8;    /* TCPOPT_TIMESTAMP */
     ts_opt->length = 10; /* TCPOLEN_TIMESTAMP */
     ts_opt->ts_val = bpf_htonl(ack->ts_val);
     ts_opt->ts_ecr = bpf_htonl(ack->ts_ecr);
-    
+
     #ifdef XDP_GEN_DEBUG
     __u32 now = (__u32)bpf_ktime_get_ns();
     xdp_gen_log("ACK delay: %u ns", (__u32)bpf_ktime_get_ns() - ack->ts_val);
     #endif
-    
+
     tcph->source = bpf_htons(ack->local_port);
     tcph->dest = bpf_htons(ack->remote_port);
     tcph->seq = bpf_htonl(ack->seq);
@@ -134,7 +157,7 @@ int xdp_gen_prog(struct xdp_md *ctx)
     tcph->fin = 0;
     tcph->syn = 0;
     tcph->rst = 0;
-    tcph->psh = 0;
+    tcph->psh = psh;
     tcph->ack = 1;
     tcph->urg = 0;
     tcph->ece = ack->ecn_flags;
@@ -145,6 +168,26 @@ int xdp_gen_prog(struct xdp_md *ctx)
 
     iph->saddr = bpf_htonl(ack->local_ip);
     iph->daddr = bpf_htonl(ack->remote_ip);
+
+#ifdef RBMC_XDP
+    if (ack->type == BPF_TCP_ACK_TYPE_SERVE) {
+        /* copy the snapshotted reply into the payload via one helper call
+         * (a per-byte loop with data_end guards blows the verifier budget). */
+        __u16 cplen = rlen;
+        if (cplen < 4)
+            cplen = 4;
+        if (cplen > RBMC_MAX_REPLY_LEN)
+            cplen = RBMC_MAX_REPLY_LEN;
+        if (unlikely(err = bpf_xdp_store_bytes(ctx, RBMC_PAYLOAD_OFF, ack->reply, cplen))) {
+            xdp_gen_log_panic("xdp_store_bytes failed: %d", err);
+            return XDP_ABORTED;
+        }
+        fill_ip_hdr(iph, rlen, false);
+        xdp_gen_log("send serve packet, seq(%u), ack_seq(%u), rlen(%u)", ack->seq, ack->ack, rlen);
+        return xmit_packet_fib_lookup(ctx, eth, iph);
+    }
+#endif
+
     fill_ip_hdr(iph, 0, false);
 
     xdp_gen_log("send ack packet, seq(%u), ack_seq(%u), rxwnd(%u)", ack->seq, ack->ack, ack->rxwnd);
@@ -390,13 +433,26 @@ int xdp_sock_prog(struct xdp_md *ctx)
      * lib TX (ack_seq == tx_next_seq) and nothing is pending — then the served
      * reply (which advances ONLY tx_next_seq) leaves tx_sent==0, so the client's
      * reply-ACK yields tx_bump==0 and never desyncs the lib's tx accounting.
-     * Otherwise fall through: Redis answers (cache still holds it for next time). */
-    if (rbmc_hit && !(tcph->ack && bpf_ntohl(tcph->ack_seq) == c->tx_next_seq && c->tx_pending == 0))
+     * Also require (a) the client's advertised window can take the reply
+     * (c->rx_remote_avail >= reply_len — don't emit out-of-window data) and
+     * (b) room in this CPU's ACK/SERVE queue. If any precondition fails fall
+     * through: Redis answers (cache still holds it for next time). */
+    if (rbmc_hit && !(tcph->ack && bpf_ntohl(tcph->ack_seq) == c->tx_next_seq &&
+                      c->tx_pending == 0 && c->rx_remote_avail >= rbmc_rlen &&
+                      rbmc_xdp_ack_room(cpu)))
         rbmc_hit = false;
     ret = tcp_rx_process(tcph, c, pkt_len, data_meta, ece, cpu, rbmc_hit);
     if (ret == XDP_TX) {
-        /* GET hit: request consumed in-order, build reply in-frame + XDP_TX */
-        return rbmc_xdp_build_reply(ctx, c, rbmc_rlen);
+        /* GET hit consumed in-order: enqueue the reply for the XDP_GEN path, then
+         * REDIRECT the (now no-payload) request frame to the lib. The redirect is
+         * what triggers run_xdp_gen this batch (gen runs only on an xsk flush), so
+         * the serve reply is emitted promptly; the lib just recycles the frame
+         * (plen=POISON → no app delivery). The reply itself is a fresh,
+         * kernel-recycled gen frame — no UMEM/fill-ring leak. */
+        rbmc_xdp_enqueue_serve(c, cpu, rbmc_rlen);
+        if (likely(qid < MAX_NIC_QUEUES))
+            return bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
+        return XDP_DROP;
     }
 #else
     ret = tcp_rx_process(tcph, c, pkt_len, data_meta, ece, cpu, false);
