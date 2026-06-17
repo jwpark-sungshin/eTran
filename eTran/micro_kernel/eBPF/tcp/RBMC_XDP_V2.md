@@ -41,7 +41,21 @@ comparable to v1's fresh gen frame. The v2 win is **no per-serve lib touch + no
 gen deferral** → lower CPU/req and lower (especially low-load) latency. See the
 v2-vs-v1 T-L A/B (`rbmcxdp-tl-v2.csv` vs `rbmcxdp-tl.csv`).
 
-## Optional future optimization (NOT needed for v2 to work): true zero-copy
+## v3 = true zero-copy (IMPLEMENTED + VERIFIED 2026-06-18)
+
+The kernel patch IS done: `evaluation/env/etran/rbmc-xdp-v3-zerocopy.patch` adds
+MLX5E_XDP_XMIT_MODE_XSK_ZC_TX — mlx5e_xmit_xdp_buff transmits the ZC UMEM frame in
+place (no xdp_convert_zc_to_xdp_frame copy) via xsk_buff_xdp_get_dma, and
+mlx5e_free_xdpsq_desc returns it to the pool with xp_free() on TX completion.
+Built as kernel 6.6.142-etranv3+ (distinct from v1/v2's 6.6.142-etran+). BPF is
+UNCHANGED from v2 (same -DRBMC_XDP_V2 in-place serve); the kernel makes the XDP_TX
+zero-copy. Verified: boots, mlx5 loads, redis-cli serve correct, GET-only 200k +
+mixed 200-conn + SET-heavy pass, no leak/panic, recycle robust at millions of
+serves. T-L A/B (median 3): v1 ~= v2 ~= v3 — at 100B/single-queue the copy is not
+the bottleneck, so no measurable win; v3's edge should appear at larger values or
+higher queue/core counts (untested). v3 is the architecturally pure serve.
+
+## (historical) the kernel patch as originally scoped
 
 To avoid mlx5's per-serve copy-to-page, a kernel patch could transmit the UMEM
 frame directly and recycle it to the fill ring on completion: add
