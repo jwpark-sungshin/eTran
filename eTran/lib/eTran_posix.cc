@@ -1061,7 +1061,14 @@ int eTran_tcp_poll_events(struct app_ctx_per_thread *tctx, struct eTrantcp_event
             nr_event += ret;
         if (unlikely(!lrpc_empty(&tctx->app_in)))
         {
-            while (!lrpc_empty(&tctx->app_in))
+            /* HookShift: bound by maxevents so we never write past the caller's
+             * events[] buffer. Un-drained app_in messages stay in the LRPC ring
+             * (process_tcp_kernel_events breaks before consuming them) and are
+             * delivered on the next poll (pending_eventfd_work keeps the loop hot)
+             * — no event is dropped. Without this, a large app_in backlog drives
+             * nr_event past maxevents, max_events goes negative, and the inner
+             * post-write guard walks off events[256] -> stack smash. */
+            while (!lrpc_empty(&tctx->app_in) && nr_event < maxevents)
                 nr_event += process_tcp_kernel_events(tctx, events + nr_event, maxevents - nr_event);
         }
     }
