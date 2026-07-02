@@ -1526,11 +1526,6 @@ void slow_path_send_tcp(struct app_ctx *actx, struct pkt_tcp *tcphdr, uint16_t l
     desc->len = len;
     desc->options = 0;
 
-    /* poll_network() only harvests the CQ while outstanding > 0; without this the frame is never
-     * returned to actx->iobuffer and every slowpath TX (SYN-ACK/RST/control) leaks one frame,
-     * exhausting the per-queue pool under multi-queue (-q >= 2) handshake bursts. */
-    xsk_info->outstanding++;
-
     xsk_ring_prod__submit(&xsk_info->tx, 1);
 
     kick_tx(xsk_info);
