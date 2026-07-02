@@ -336,11 +336,15 @@ int tcp_nic_poll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_eve
     for (qidx = 0; qidx < nr_nic_queues; qidx++)
     {
         uint32_t sp = 0;
-        if (tctx->txrx_xsk_info[qidx]->outstanding)
+        /* HookShift: peek even when our own outstanding is 0 — the micro-kernel's slowpath TX
+         * (SYN-ACK/RST/control) completes into this same CQ and is reclaimed only here (the
+         * from_slowpath branch below). Gating on our outstanding left those frames unreaped
+         * whenever the app had no TX in flight (e.g. a pure handshake burst), draining the
+         * per-queue pool and wedging -q>=2 at ~480 concurrent connects. */
         {
             CQ_LOCK(qidx);
             cq = CQ(qidx);
-            rcvd = eTran_cq__peek(cq, std::min(tctx->txrx_xsk_info[qidx]->outstanding, TX_BATCH_SIZE), &idx_cq, tctx->actx->uring[qidx].comp_offset);
+            rcvd = eTran_cq__peek(cq, TX_BATCH_SIZE, &idx_cq, tctx->actx->uring[qidx].comp_offset);
             for (unsigned int i = 0; i < rcvd; i++) {
                 uint64_t addr = *eTran_cq__comp_addr(cq, idx_cq + i, tctx->actx->uring[qidx].comp_offset);
                 if (unlikely(tcp_txmeta_get_from_slowpath(tctx->txrx_xsk_info[qidx]->umem_area, addr) || 
@@ -608,11 +612,15 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
     for (qidx = 0; qidx < nr_nic_queues; qidx++)
     {
         uint32_t sp = 0;
-        if (tctx->txrx_xsk_info[qidx]->outstanding)
+        /* HookShift: peek even when our own outstanding is 0 — the micro-kernel's slowpath TX
+         * (SYN-ACK/RST/control) completes into this same CQ and is reclaimed only here (the
+         * from_slowpath branch below). Gating on our outstanding left those frames unreaped
+         * whenever the app had no TX in flight (e.g. a pure handshake burst), draining the
+         * per-queue pool and wedging -q>=2 at ~480 concurrent connects. */
         {
             CQ_LOCK(qidx);
             cq = CQ(qidx);
-            rcvd = eTran_cq__peek(cq, std::min(tctx->txrx_xsk_info[qidx]->outstanding, TX_BATCH_SIZE), &idx_cq, tctx->actx->uring[qidx].comp_offset);
+            rcvd = eTran_cq__peek(cq, TX_BATCH_SIZE, &idx_cq, tctx->actx->uring[qidx].comp_offset);
             for (unsigned int i = 0; i < rcvd; i++) {
                 uint64_t addr = *eTran_cq__comp_addr(cq, idx_cq + i, tctx->actx->uring[qidx].comp_offset);
                 if (unlikely(tcp_txmeta_get_from_slowpath(tctx->txrx_xsk_info[qidx]->umem_area, addr) || 
