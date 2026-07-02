@@ -26,11 +26,10 @@
 // we use cc_idx to identify each connection
 // TODO: much more configurable
 SEC(".data.prev_conn")
-__u32 prev_conn[MAX_CPU] = {__UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-                            __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-                            __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-                            __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-};
+/* every slot must start at NULL_CONN: 0 is a VALID cc_idx, so an unfilled slot makes the
+ * first packet on that cpu emit a spurious deferred ACK for connection 0 (the old 20-entry
+ * literal left cpus >= 20 zero-initialized — broken for any serve core >= 20). */
+__u32 prev_conn[MAX_CPU] = {[0 ... MAX_CPU - 1] = NULL_CONN};
 __u32 prev_conn_li[MAX_CPU];
 __u16 prev_conn_lp[MAX_CPU];
 __u32 prev_conn_ri[MAX_CPU];
