@@ -15,7 +15,7 @@
 
 #define MAX_PEER 32
 
-#define MAX_NIC_QUEUES 20
+#define MAX_NIC_QUEUES 32
 #define MAX_XSK_FD 1024
 
 #define CACHE_LINE_SIZE 64
